@@ -40,7 +40,7 @@ TAGGED_OUTPUT_FILE_PATTERN = "tagged_chunk_batch_{batch_num}.jsonl"
 FILTER_STATS_CSV = Path("./qwen3_filter_stats.csv") # <<< UPDATED (though not used in this script)
 
 # --- Model Configuration ---
-MODEL_ID = "../Qwen3-0.6B-FP8" # <<< UPDATED to local path
+MODEL_ID = "../Qwen3-0.6B" # <<< UPDATED to local path
 LLM_FILTER_BATCH_SIZE = 128 # Adjust based on V100 16GB VRAM with FP8
 MAX_CONTEXT_LEN_FILTER = 2048
 MAX_NEW_TOKENS_FILTER = 10 # Enough for YES/NO + EOS
