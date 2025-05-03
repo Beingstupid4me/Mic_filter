@@ -110,8 +110,8 @@ def format_filter_prompt(text_chunk):
 6.  **State Actor Causality Check:** If criteria 2-5 are met, does the text indicate that the military forces of one country caused the casualties to the military forces of the *other* country? (Answer Yes/No/NA)
 
 **Decision:**
-*   If the answer to Check 1 is **YES**, the article is **NOT** an MIC.
-*   If the answer to Check 1 is **NO**, but the answer to *any* of Checks 2, 3, 4, 5, or 6 is **NO** (where applicable), the article is **NOT** clearly an MIC described fully in the text (it might be related but lacks key details for our definition).
+*   If the answer to Check 1 is **YES**, the article is **NOT** an MIC, the decision is made to remove and we are done here no need to check further.
+*   If the answer to Check 1 is **NO**, but the answer to *any* of Checks 2, 3, 4, 5, or 6 is **NO** (where applicable), the article is **NOT** clearly an MIC described fully in the text (it might be related but lacks key details for our definition), the decision is made to remove and we are done here no need to check further.
 *   Only if Check 1 is NO AND Checks 2, 3, 4, 5, 6 are ALL YES or  if Check 1 and 2 are NO AND Checks 3, 4, 5, 6 are ALL YES  should you consider it potentially a relevant MIC event for further review.
 
 Based on your checklist analysis:
@@ -121,7 +121,7 @@ Otherwise, if the checklist suggests it *might* be a relevant MIC event OR if yo
 Article Text:
 {context}
 
-Final Answer (ONLY REMOVE or KEEP):"""
+Final Answer (ONLY REMOVE or KEEP, do not include anything else, final answer should be just one word):"""
     user_content = instructions.format(context=text_chunk)
     messages = [{"role": "user", "content": user_content}]
     return messages
