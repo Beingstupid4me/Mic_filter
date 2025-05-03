@@ -44,7 +44,7 @@ FILTER_STATS_CSV = Path("./qwen_filter_stats.csv") # Corrected stats filename
 MODEL_ID = "../Qwen3-1.7B" #
 LLM_FILTER_BATCH_SIZE = 64 # <<< REDUCED BATCH SIZE
 MAX_CONTEXT_LEN_FILTER = 2048
-MAX_NEW_TOKENS_FILTER = 200
+MAX_NEW_TOKENS_FILTER = 512
 
 # --- Text Cleaning & Preparation ---
 HEADER_PATTERN = re.compile(r'^Search Strategy.*?Results: \d+\s*(?=Document \d+ of \d+|\n\n|$)', re.DOTALL | re.MULTILINE | re.IGNORECASE)
