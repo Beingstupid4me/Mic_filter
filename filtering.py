@@ -112,19 +112,18 @@ def load_filter_llm_model_and_tokenizer(model_id_path):
 
 # --- LLM Prompt Engineering for Filtering ---
 def format_filter_prompt(text_chunk):
-    """Creates the prompt asking the LLM to identify non-MIC articles."""
-    instructions = """You are a defense analyst. Analyze the following article text. Determine if the text is CLEARLY **NOT** about a militarized inter-state clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news or sports news or finance news or accidents news or political news, without direct military clashes, etc.
-
-If you are **highly confident** the text is **NOT** an MIC event as described, answer ONLY with the word "YES".
-Otherwise, if there is a possibility it *could* be an MIC event, or if you are unsure, answer ONLY with the word "NO".
-
+    """Creates the prompt asking the LLM to identify non-MIC articles with /think enabled."""
+    instructions = """You are a defense analyst. Analyze the following article text. Determine if the text is CLEARLY NOT about a militarized inter-state clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news or sports news or finance news or accidents news or political news, without direct military clashes, etc.
+If you are highly confident the text is NOT an MIC event as described, answer ONLY with the word "YES".
+Otherwise, if there is a possibility it could be an MIC event, or if you are unsure, answer ONLY with the word "NO".
 Article Text:
 {context}
-
 Answer (ONLY YES or NO):"""
-    user_content = instructions.format(context=text_chunk)
+    # Add /think directive to activate reasoning mode
+    user_content = "/think\n" + instructions.format(context=text_chunk)
     messages = [{"role": "user", "content": user_content}]
     return messages
+
 
 # --- Data Loading ---
 def load_data_only(directory, header_stripper):
@@ -168,15 +167,18 @@ def run_filter_verification(model, tokenizer, gen_kwargs):
     results = {}
     is_dataparallel = isinstance(model, torch.nn.DataParallel)
     model_device = next(model.parameters()).device
-
     for name, text in samples.items():
         logger.info(f"\nVerifying: {name}")
         logger.info(f"Input Text:\n{text}")
         prompt_messages = format_filter_prompt(text)
         try:
-            input_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-            tokenized_input = tokenizer(input_text, return_tensors="pt").to(model_device) # No padding needed for single input
-
+            input_text = tokenizer.apply_chat_template(
+                prompt_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True  # <<< Enable Thinking Mode
+            )
+            tokenized_input = tokenizer(input_text, return_tensors="pt").to(model_device)
             with torch.no_grad():
                 generate_func = model.module.generate if is_dataparallel else model.generate
                 outputs = generate_func(input_ids=tokenized_input['input_ids'], attention_mask=tokenized_input['attention_mask'], **gen_kwargs)
@@ -189,10 +191,10 @@ def run_filter_verification(model, tokenizer, gen_kwargs):
         except Exception as e:
             logger.error(f"Error during verification for '{name}': {e}")
             results[name] = "VERIFICATION_ERROR"
-
     logger.info("--- Filter Verification Complete ---")
     logger.info(f"Expected 'Potential MIC' -> NO (Result: {results.get('Potential MIC', 'ERROR')})")
     logger.info(f"Expected 'Likely Non-MIC (Sports)' -> YES (Result: {results.get('Likely Non-MIC (Sports)', 'ERROR')})")
+
     # Simple check if results match expectations
     mic_correct = results.get('Potential MIC') == 'NO'
     non_mic_correct = results.get('Likely Non-MIC (Sports)') == 'YES'
@@ -203,64 +205,100 @@ def run_filter_verification(model, tokenizer, gen_kwargs):
         logger.warning("Verification results DO NOT match expectations! Check model/prompt.")
         return False
 
-
 # --- LLM Filtering Execution ---
 def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs):
     """Uses LLM to classify items as definitely NOT MIC."""
     logger.info(f"--- LLM Filtering Stage ({len(items_to_process)} items) ---")
     logger.info(f"Batch Size: {batch_size}")
-    all_decisions = {} # Store decision for each original index: True=Keep, False=Remove
+    all_decisions = {}  # Store decision for each original index: True=Keep, False=Remove
     num_processed = 0
     num_excluded = 0
     is_dataparallel = isinstance(model, torch.nn.DataParallel)
     model_device = next(model.parameters()).device
-
     prompts_and_indices = []
+
     for idx, item in enumerate(items_to_process):
         cleaned_body = prepare_text_for_filter_llm(item["article_body"])
-        if cleaned_body: prompts_and_indices.append({"messages": format_filter_prompt(cleaned_body), "original_index": idx})
-        else: all_decisions[idx] = True
+        if cleaned_body:
+            prompts_and_indices.append({"messages": format_filter_prompt(cleaned_body), "original_index": idx})
+        else:
+            all_decisions[idx] = True
 
-    if not prompts_and_indices: logger.error("No valid items to filter."); return {}
+    if not prompts_and_indices:
+        logger.error("No valid items to filter.")
+        return {}
+
     total_batches = (len(prompts_and_indices) + batch_size - 1) // batch_size
     logger.info(f"Total batches for LLM filtering: {total_batches}")
 
     for i in tqdm(range(0, len(prompts_and_indices), batch_size), desc="LLM Filtering", unit="batch"):
-        batch_data = prompts_and_indices[i : i+batch_size]
+        batch_data = prompts_and_indices[i: i + batch_size]
         batch_messages = [item['messages'] for item in batch_data]
         batch_original_indices = [item['original_index'] for item in batch_data]
-        tokenized_inputs = None; batch_num = i // batch_size + 1
+        tokenized_inputs = None
+        batch_num = i // batch_size + 1
 
         try:
-            batch_inputs_text = [ tokenizer.apply_chat_template( p, tokenize=False, add_generation_prompt=True, enable_thinking=False ) for p in batch_messages ]
-            tokenized_inputs = tokenizer( batch_inputs_text, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONTEXT_LEN_FILTER, return_attention_mask=True ).to(model_device)
-        except Exception as e: logger.error(f"Tokenization error batch {batch_num}/{total_batches}: {e}", exc_info=True); all_decisions.update({idx: True for idx in batch_original_indices}); continue
+            batch_inputs_text = [
+                tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+                for p in batch_messages
+            ]
+            tokenized_inputs = tokenizer(
+                batch_inputs_text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=MAX_CONTEXT_LEN_FILTER,
+                return_attention_mask=True
+            ).to(model_device)
+        except Exception as e:
+            logger.error(f"Tokenization error batch {batch_num}/{total_batches}: {e}", exc_info=True)
+            all_decisions.update({idx: True for idx in batch_original_indices})
+            continue
 
         raw_responses = ["ERROR"] * len(batch_messages)
         try:
             with torch.no_grad():
                 generate_func = model.module.generate if is_dataparallel else model.generate
-                outputs = generate_func( input_ids=tokenized_inputs['input_ids'], attention_mask=tokenized_inputs['attention_mask'], **gen_kwargs )
-                input_length = tokenized_inputs['input_ids'].shape[1]; generated_tokens = outputs[:, input_length:]
-                raw_responses = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True); del outputs
+                outputs = generate_func(
+                    input_ids=tokenized_inputs['input_ids'],
+                    attention_mask=tokenized_inputs['attention_mask'],
+                    **gen_kwargs
+                )
+                input_length = tokenized_inputs['input_ids'].shape[1]
+                generated_tokens = outputs[:, input_length:]
+                raw_responses = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+                del outputs
         except RuntimeError as e:
-            if "out of memory" in str(e).lower(): logger.warning(f"OOM filter batch {batch_num}. Marking KEEP.")
-            else: logger.error(f"Runtime error filter batch {batch_num}: {e}", exc_info=False)
-            all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
-        except Exception as e: logger.error(f"Unexpected error filter batch {batch_num}: {e}", exc_info=False); all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
+            if "out of memory" in str(e).lower():
+                logger.warning(f"OOM filter batch {batch_num}. Marking KEEP.")
+            else:
+                logger.error(f"Runtime error filter batch {batch_num}: {e}", exc_info=False)
+            all_decisions.update({idx: True for idx in batch_original_indices})
+        except Exception as e:
+            logger.error(f"Unexpected error filter batch {batch_num}: {e}", exc_info=False)
+            all_decisions.update({idx: True for idx in batch_original_indices})
         finally:
-             if tokenized_inputs is not None: del tokenized_inputs
-             gc.collect()
+            if tokenized_inputs is not None:
+                del tokenized_inputs
+            gc.collect()
 
         for idx, response in enumerate(raw_responses):
             original_idx = batch_original_indices[idx]
             if original_idx not in all_decisions:
-                 response_clean = response.strip().upper()
-                 if response_clean == "YES": all_decisions[original_idx] = False; num_excluded += 1
-                 else: all_decisions[original_idx] = True
-                 if response_clean != "NO" and response_clean != "YES": logger.debug(f"Unexpected filter answer item {original_idx}: '{response}'. Keeping.")
+                response_clean = response.strip().upper()
+                if response_clean == "YES":
+                    all_decisions[original_idx] = False
+                    num_excluded += 1
+                elif response_clean == "NO":
+                    all_decisions[original_idx] = True
+                else:
+                    logger.debug(f"Unexpected filter answer item {original_idx}: '{response}'. Defaulting to KEEP.")
+                    all_decisions[original_idx] = True
+
         num_processed += len(batch_messages)
-        if batch_num % 50 == 0 or batch_num == total_batches: logger.info(f"Processed filter batch {batch_num}/{total_batches}...")
+        if batch_num % 50 == 0 or batch_num == total_batches:
+            logger.info(f"Processed filter batch {batch_num}/{total_batches}...")
 
     logger.info("--- LLM Filtering COMPLETE ---")
     kept_count = sum(1 for status in all_decisions.values() if status)
