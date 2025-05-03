@@ -10,7 +10,6 @@ import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
-# Accelerator might be used implicitly by device_map, keep it for now
 from accelerate import Accelerator
 import gc
 
@@ -41,10 +40,10 @@ TAGGED_OUTPUT_FILE_PATTERN = "tagged_chunk_batch_{batch_num}.jsonl"
 FILTER_STATS_CSV = Path("./qwen_filter_stats.csv")
 
 # --- Model Configuration ---
-MODEL_ID = "../Qwen3-1.7B" # Local Qwen3 1.7B path
-LLM_FILTER_BATCH_SIZE = 64 # Keep specified batch size
+MODEL_ID = "../Qwen3-1.7B"
+LLM_FILTER_BATCH_SIZE = 64
 MAX_CONTEXT_LEN_FILTER = 2048
-MAX_NEW_TOKENS_FILTER = 250 # Keep allowance for <think> + answer
+MAX_NEW_TOKENS_FILTER = 300 # Increased slightly more for potentially longer checklist reasoning
 
 # --- Text Cleaning & Preparation ---
 HEADER_PATTERN = re.compile(r'^Search Strategy.*?Results: \d+\s*(?=Document \d+ of \d+|\n\n|$)', re.DOTALL | re.MULTILINE | re.IGNORECASE)
@@ -79,7 +78,7 @@ def load_filter_llm_model_and_tokenizer(model_id_path):
         logger.info(f"--- Loading Filter LLM & Tokenizer ({model_path}) ---")
         if not torch.cuda.is_available(): logger.error("CUDA not available."); raise RuntimeError("CUDA not available")
         logger.info(f"Found {torch.cuda.device_count()} GPU(s).")
-        target_dtype = torch.float16 # Force FP16 for V100 compatibility
+        target_dtype = torch.float16 # Force FP16 for V100
         logger.info(f"Loading model in FP16...")
         model = AutoModelForCausalLM.from_pretrained( model_path, torch_dtype=target_dtype, device_map="auto", trust_remote_code=True )
         logger.info(f"Filter LLM model loaded with dtype: {model.dtype}.")
@@ -96,21 +95,34 @@ def load_filter_llm_model_and_tokenizer(model_id_path):
         return model, tokenizer
     except Exception as e: logger.error(f"Filter LLM load failed: {str(e)}", exc_info=True); raise
 
-# --- LLM Prompt Engineering for Filtering (Revised Output Instruction) ---
+# --- LLM Prompt Engineering for Filtering (Checklist Approach) ---
 def format_filter_prompt(text_chunk):
-    """Creates the prompt asking the LLM to classify non-MIC articles."""
-    # <<< REVISED INSTRUCTIONS >>>
-    instructions = """Analyze the following article text. Determine if the text is CLEARLY and DEFINITIVELY **NOT** about a militarized clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news, sports, finance, accidents, politics without direct military clashes, etc.
+    """Creates the prompt asking the LLM to follow a checklist and classify."""
+    # <<< REVISED INSTRUCTIONS with Checklist >>>
+    instructions = """You are a defense analyst assessing article relevance. Analyze the article text below by following this checklist step-by-step to determine if the article can be definitively excluded as a non-MIC event. A Militarized Interstate Confrontation (MIC) for this purpose involves military forces of one country causing fatalities to military forces of another country.
 
-If you are **highly confident** the text is **NOT** an MIC event as described, your final answer **MUST** be the single word: "REMOVE".
-Otherwise, if there is any possibility it *could* be an MIC event, or if you are unsure, your final answer **MUST** be the single word: "KEEP".
+**Checklist:**
+1.  **Non-MIC Topic Check:** Is the article CLEARLY about unrelated topics like sports, finance, domestic politics (without international military clashes), entertainment, science, non-military accidents, or weather/disasters? (Answer Yes/No)
+2.  **Casualty Check:** Does the article mention any deaths, fatalities, or casualties? (Answer Yes/No)
+3.  **Military Actor Check:** Does the article involve military/militia/armed state forces (e.g., army, troops, soldiers, police *in a conflict role*, militants if state-backed)? (Answer Yes/No)
+4.  **Causality Check:** If casualties and military actors are present, does the text suggest the military actors *caused* the casualties in a conflict situation? (Answer Yes/No/NA)
+5.  **Interstate Check:** If criteria 2, 3, and 4 are met, does the conflict involve actors explicitly identified or strongly implied as belonging to **two different countries/states**? (Answer Yes/No/NA)
+6.  **State Actor Causality Check:** If criteria 2-5 are met, does the text indicate that the military forces of one country caused the casualties to the military forces of the *other* country? (Answer Yes/No/NA)
+
+**Decision:**
+*   If the answer to Check 1 is **YES**, the article is **NOT** an MIC.
+*   If the answer to Check 1 is **NO**, but the answer to *any* of Checks 2, 3, 4, 5, or 6 is **NO** (where applicable), the article is **NOT** clearly an MIC described fully in the text (it might be related but lacks key details for our definition).
+*   Only if Check 1 is NO AND Checks 2, 3, 4, 5, 6 are ALL YES or  if Check 1 and 2 are NO AND Checks 3, 4, 5, 6 are ALL YES  should you consider it potentially a relevant MIC event for further review.
+
+Based on your checklist analysis:
+If you are **highly confident** the article can be excluded based on the checklist (e.g., Check 1 is YES, or subsequent checks are NO), your final answer **MUST** be the single word: "REMOVE".
+Otherwise, if the checklist suggests it *might* be a relevant MIC event OR if you are unsure about any step, your final answer **MUST** be the single word: "KEEP".
 
 Article Text:
 {context}
 
 Final Answer (ONLY REMOVE or KEEP):"""
     user_content = instructions.format(context=text_chunk)
-    # Use the messages format expected by the model's chat template
     messages = [{"role": "user", "content": user_content}]
     return messages
 
@@ -130,23 +142,20 @@ def load_data_only(directory, header_stripper):
                     try:
                         data = json.loads(line.strip()); total_chunks_read += 1
                         if "raw_chunk_text" in data and isinstance(data["raw_chunk_text"], str):
-                            raw_text = data["raw_chunk_text"]
-                            article_body = header_stripper(raw_text)
+                            raw_text = data["raw_chunk_text"]; article_body = header_stripper(raw_text)
                             if not article_body: continue
                             item = { "raw_text": raw_text, "article_body": article_body, "metadata": { "source_file": data.get("original_file"), "original_subdir": data.get("original_subdir"), "representative_year": data.get("representative_year"), "chunk_index_in_file": data.get("chunk_index_in_file"), "inferred_date": data.get("inferred_date"), "publication_date": data.get("publication_date") } }
                             all_items.append(item)
                     except json.JSONDecodeError: logger.warning(f"Skipping invalid JSON line {line_num} in {file_path.name}")
                     except Exception as e: logger.warning(f"Error processing line {line_num} in {file_path.name}: {e}", exc_info=False)
         except Exception as e: logger.error(f"Failed read/process file {file_path}: {e}", exc_info=True)
-    logger.info(f"--- Initial Data Load COMPLETE ---")
-    logger.info(f"   Total raw chunks read: {total_chunks_read:,}")
-    logger.info(f"   Valid items loaded for processing: {len(all_items):,}")
+    logger.info(f"--- Initial Data Load COMPLETE ---"); logger.info(f"   Total raw chunks read: {total_chunks_read:,}"); logger.info(f"   Valid items loaded: {len(all_items):,}")
     return all_items
 
-# --- LLM Filter Verification Function (Revised Expected Output) ---
+# --- LLM Filter Verification Function (Checklist Prompt) ---
 def run_filter_verification(model, tokenizer, gen_kwargs):
     """Runs the filter LLM on examples, checks for REMOVE/KEEP after <think>."""
-    logger.info("--- Running Filter LLM Verification ---")
+    logger.info("--- Running Filter LLM Verification (Checklist Prompt) ---")
     samples = {
         "Potential MIC": "Reports emerged on Tuesday detailing a border clash between troops from Country A and Country B near the disputed checkpoint XY. Initial accounts suggest three soldiers from Country A were killed during the firefight, while Country B acknowledged suffering 'some casualties'.",
         "Likely Non-MIC (Sports)": "The Lions secured a stunning victory over the Eagles last night with a final score of 28-24. Quarterback Johnson threw three touchdown passes, including the game-winner in the final minute. Fans celebrated wildly as the team clinched the division title."
@@ -158,56 +167,33 @@ def run_filter_verification(model, tokenizer, gen_kwargs):
     for name, text in samples.items():
         logger.info(f"\nVerifying: {name}")
         logger.info(f"Input Text:\n{text}")
-        prompt_messages = format_filter_prompt(text)
+        prompt_messages = format_filter_prompt(text) # Uses the checklist prompt
         final_answer = "VERIFICATION_ERROR"
         try:
-            input_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True) # Thinking is enabled default
+            input_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True) # Enable thinking
             tokenized_input = tokenizer(input_text, return_tensors="pt").to(model_device)
-
             with torch.no_grad():
                 generate_func = model.module.generate if is_dataparallel else model.generate
-                # Use slightly larger max_tokens for verification
-                outputs = generate_func(input_ids=tokenized_input['input_ids'], attention_mask=tokenized_input['attention_mask'], max_new_tokens=250, do_sample=False, pad_token_id=gen_kwargs['pad_token_id'], eos_token_id=gen_kwargs['eos_token_id'])
-                input_length = tokenized_input['input_ids'].shape[1]
-                generated_tokens = outputs[:, input_length:]
+                outputs = generate_func(input_ids=tokenized_input['input_ids'], attention_mask=tokenized_input['attention_mask'], max_new_tokens=300, do_sample=False, pad_token_id=gen_kwargs['pad_token_id'], eos_token_id=gen_kwargs['eos_token_id']) # More tokens for verification
+                input_length = tokenized_input['input_ids'].shape[1]; generated_tokens = outputs[:, input_length:]
                 raw_response = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
             logger.info(f"Raw Output (may include think): '{raw_response}'")
-
-            # Extract final answer after </think>
-            think_end_tag = "</think>"
-            think_end_index = raw_response.find(think_end_tag)
-            if think_end_index != -1:
-                final_answer_text = raw_response[think_end_index + len(think_end_tag):].strip()
-                logger.info(f"Extracted final answer: '{final_answer_text}'")
-            else:
-                final_answer_text = raw_response.strip()
-                logger.info("No </think> tag found, using full response.")
-
-            # Check specifically for KEEP or REMOVE
-            if "REMOVE" in final_answer_text.upper():
-                 results[name] = "REMOVE"
-            elif "KEEP" in final_answer_text.upper():
-                 results[name] = "KEEP"
-            else:
-                 results[name] = f"UNEXPECTED_ANSWER: {final_answer_text}"
-
+            think_end_tag = "</think>"; think_end_index = raw_response.find(think_end_tag)
+            final_answer_text = raw_response[think_end_index + len(think_end_tag):].strip() if think_end_index != -1 else raw_response.strip()
+            logger.info(f"Extracted final answer: '{final_answer_text}'")
+            # Use uppercase for reliable comparison
+            results[name] = final_answer_text.upper()
             del outputs, tokenized_input
-
-        except Exception as e:
-            logger.error(f"Error during verification for '{name}': {e}")
-            results[name] = "VERIFICATION_ERROR"
+        except Exception as e: logger.error(f"Error during verification for '{name}': {e}"); results[name] = "VERIFICATION_ERROR"
 
     logger.info("--- Filter Verification Complete ---")
+    # Expected results based on the *new* prompt asking for REMOVE/KEEP
     logger.info(f"Expected 'Potential MIC' -> KEEP (Result: {results.get('Potential MIC', 'ERROR')})")
     logger.info(f"Expected 'Likely Non-MIC (Sports)' -> REMOVE (Result: {results.get('Likely Non-MIC (Sports)', 'ERROR')})")
     mic_correct = results.get('Potential MIC') == 'KEEP'
     non_mic_correct = results.get('Likely Non-MIC (Sports)') == 'REMOVE'
-    if mic_correct and non_mic_correct:
-        logger.info("Verification results match expectations.")
-        return True
-    else:
-        logger.warning("Verification results DO NOT match expectations! Check model/prompt/extraction.")
-        return False
+    if mic_correct and non_mic_correct: logger.info("Verification results match expectations."); return True
+    else: logger.warning("Verification results DO NOT match expectations! Check model/prompt/extraction."); return False
 
 
 # --- LLM Filtering Execution (Revised Output Parsing) ---
@@ -237,7 +223,7 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
         tokenized_inputs = None; batch_num = i // batch_size + 1
 
         try:
-            # Enable thinking by default
+            # Thinking enabled by default
             batch_inputs_text = [ tokenizer.apply_chat_template( p, tokenize=False, add_generation_prompt=True ) for p in batch_messages ]
             tokenized_inputs = tokenizer( batch_inputs_text, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONTEXT_LEN_FILTER, return_attention_mask=True ).to(model_device)
         except Exception as e: logger.error(f"Tokenization error batch {batch_num}/{total_batches}: {e}", exc_info=True); all_decisions.update({idx: True for idx in batch_original_indices}); continue
@@ -252,13 +238,13 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
         except RuntimeError as e:
             if "out of memory" in str(e).lower(): logger.warning(f"OOM filter batch {batch_num}. Marking KEEP.")
             else: logger.error(f"Runtime error filter batch {batch_num}: {e}", exc_info=False)
-            all_decisions.update({idx: True for idx in batch_original_indices})
-        except Exception as e: logger.error(f"Unexpected error filter batch {batch_num}: {e}", exc_info=False); all_decisions.update({idx: True for idx in batch_original_indices})
+            all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
+        except Exception as e: logger.error(f"Unexpected error filter batch {batch_num}: {e}", exc_info=False); all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
         finally:
              if tokenized_inputs is not None: del tokenized_inputs
              gc.collect()
 
-        # Process responses: Extract final answer after </think>
+        # Process responses: Extract answer after </think> and check for REMOVE/KEEP
         for idx, raw_response in enumerate(raw_responses):
             original_idx = batch_original_indices[idx]
             if original_idx not in all_decisions: # Only process if no prior error
@@ -269,10 +255,13 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
                  else: final_answer_text = raw_response.strip()
 
                  response_clean = final_answer_text.upper()
-                 # Check if the *extracted* answer is REMOVE
-                 if response_clean == "REMOVE": all_decisions[original_idx] = False; num_excluded += 1 # Exclude
-                 else: all_decisions[original_idx] = True # Keep (KEEP, garbage, error)
-                 if response_clean != "KEEP" and response_clean != "REMOVE": logger.debug(f"Unexpected filter answer item {original_idx}: Final='{final_answer_text}' (Raw='{raw_response[:50]}...'). Keeping.")
+                 # <<< UPDATED Logic: Check for REMOVE, otherwise KEEP >>>
+                 if response_clean == "REMOVE":
+                     all_decisions[original_idx] = False # Mark for REMOVAL
+                     num_excluded += 1
+                 else:
+                     all_decisions[original_idx] = True # KEEP (if it's KEEP, garbage, or error)
+                     if response_clean != "KEEP": logger.debug(f"Unexpected final answer item {original_idx}: '{final_answer_text}'. Keeping.")
 
         num_processed += len(batch_messages)
         if batch_num % 50 == 0 or batch_num == total_batches: logger.info(f"Processed filter batch {batch_num}/{total_batches}...")
@@ -286,7 +275,7 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
 
 
 # --- Function to Save Tagged Data ---
-# (No changes needed from previous version)
+# (No changes needed)
 def save_tagged_data(all_original_items, candidate_status, output_dir, file_pattern, batch_size=50000):
     logger.info(f"--- Saving Tagged Data to {output_dir} ---")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -321,7 +310,7 @@ def save_tagged_data(all_original_items, candidate_status, output_dir, file_patt
 def main_filtering_session():
     overall_start_time = time.time()
     logger.info("\n=====================================================")
-    logger.info("====== Starting MIC Pre-Filtering Pipeline (Qwen Filter w/ Think Handling) =====")
+    logger.info("====== Starting MIC Pre-Filtering Pipeline (Qwen Filter w/ Checklist & Think Handling) =====")
     logger.info(f"====== Start Time: {datetime.now()} ======")
     logger.info("=====================================================\n")
 
@@ -348,8 +337,7 @@ def main_filtering_session():
     # Phase 2b: Run Filter Verification
     logger.info("\n--- Phase 2b: Running Filter Verification ---")
     verification_passed = run_filter_verification(llm_model, llm_tokenizer, FILTER_GEN_KWARGS)
-    if not verification_passed:
-        logger.warning("Filter verification failed! Check model/prompt. Continuing cautiously...")
+    if not verification_passed: logger.warning("Filter verification failed! Check model/prompt. Continuing...")
 
     # Phase 3: Run LLM Filtering
     logger.info("\n--- Phase 3: Running LLM Filtering ---")
@@ -383,7 +371,7 @@ def main_filtering_session():
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    logger.info("--- Script Execution Started (Qwen Pre-Filtering Session with Think Handling) ---")
+    logger.info("--- Script Execution Started (Qwen Pre-Filtering with Checklist Prompt) ---")
     if not STEP1_INPUT_DIR.exists() or not STEP1_INPUT_DIR.is_dir():
         logger.error(f"Input directory missing: {STEP1_INPUT_DIR}"); logger.error("Pipeline aborting.")
     else:
