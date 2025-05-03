@@ -179,7 +179,7 @@ def run_filter_verification(model, tokenizer, gen_kwargs):
                 raw_response = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
             logger.info(f"Raw Output (may include think): '{raw_response}'")
             think_end_tag = "</think>"; think_end_index = raw_response.find(think_end_tag)
-            final_answer_text = raw_response[think_end_index + len(think_end_tag):].strip() if think_end_index != -1 else raw_response.strip()
+            final_answer_text = raw_response.split(think_end_tag)[1]
             logger.info(f"Extracted final answer: '{final_answer_text}'")
             # Use uppercase for reliable comparison
             results[name] = final_answer_text.upper()
