@@ -41,8 +41,8 @@ TAGGED_OUTPUT_FILE_PATTERN = "tagged_chunk_batch_{batch_num}.jsonl"
 FILTER_STATS_CSV = Path("./qwen_filter_stats.csv") # Corrected stats filename
 
 # --- Model Configuration ---
-MODEL_ID = "Qwen/Qwen2-0.5B-Instruct" # Back to non-FP8 model compatible with V100
-LLM_FILTER_BATCH_SIZE = 100 # <<< REDUCED BATCH SIZE
+MODEL_ID = "../Qwen3-1.7B" #
+LLM_FILTER_BATCH_SIZE = 64 # <<< REDUCED BATCH SIZE
 MAX_CONTEXT_LEN_FILTER = 2048
 MAX_NEW_TOKENS_FILTER = 10
 
@@ -113,10 +113,10 @@ def load_filter_llm_model_and_tokenizer(model_id_path):
 # --- LLM Prompt Engineering for Filtering ---
 def format_filter_prompt(text_chunk):
     """Creates the prompt asking the LLM to identify non-MIC articles."""
-    instructions = """Analyze the following article text. Determine if the text is CLEARLY and DEFINITIVELY **NOT** about a militarized clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news, sports, finance, accidents, politics without direct military clashes, etc.
+    instructions = """Analyze the following article text. Determine if the text is CLEARLY **NOT** about a militarized clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news or sports news or finance news or accidents news or political news, without direct military clashes, etc.
 
 If you are **confident** the text is **NOT** an MIC event as described, answer ONLY with the word "YES".
-Otherwise, if there is any possibility it *could* be an MIC event, or if you are unsure, answer ONLY with the word "NO".
+Otherwise, if there is a possibility it *could* be an MIC event, or if you are unsure, answer ONLY with the word "NO".
 
 Article Text:
 {context}
