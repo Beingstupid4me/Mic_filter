@@ -120,7 +120,7 @@ Article Text:
 {context}
 Answer (ONLY YES or NO):"""
     # Add /think directive to activate reasoning mode
-    user_content = "/think\n" + instructions.format(context=text_chunk)
+    user_content = "\n" + instructions.format(context=text_chunk)
     messages = [{"role": "user", "content": user_content}]
     return messages
 
