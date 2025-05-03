@@ -33,15 +33,16 @@ warnings.filterwarnings("ignore", message=".*A decoder-only architecture is bein
 warnings.filterwarnings("ignore", message=".*Passing `attn_implementation_preference` is deprecated.*")
 warnings.filterwarnings("ignore", message=".*Using the pipeline API to.*")
 
+
 # --- Input/Output Paths ---
-STEP1_INPUT_DIR = Path("../Amartya_tasker/structured_parsed_chunks_combined") # Local input path
-TAGGED_OUTPUT_DIR = Path("./filtered_tagged_chunks") # Local output path
+STEP1_INPUT_DIR = Path("../Amartya_tasker/structured_parsed_chunks_combined")
+TAGGED_OUTPUT_DIR = Path("./filtered_tagged_chunks")
 TAGGED_OUTPUT_FILE_PATTERN = "tagged_chunk_batch_{batch_num}.jsonl"
-FILTER_STATS_CSV = Path("./qwen3_filter_stats.csv") # Local stats path
+FILTER_STATS_CSV = Path("./qwen_filter_stats.csv") # Corrected stats filename
 
 # --- Model Configuration ---
-MODEL_ID = "../Qwen3-0.6B" # <<< USING LOCAL QWEN3 PATH as requested
-LLM_FILTER_BATCH_SIZE = 128 # Adjust based on V100 16GB VRAM with FP16
+MODEL_ID = "Qwen/Qwen2-0.5B-Instruct" # Back to non-FP8 model compatible with V100
+LLM_FILTER_BATCH_SIZE = 100 # <<< REDUCED BATCH SIZE
 MAX_CONTEXT_LEN_FILTER = 2048
 MAX_NEW_TOKENS_FILTER = 10
 
@@ -54,10 +55,8 @@ def strip_proquest_header(text):
     if not isinstance(text, str): return ""
     cleaned_text, num_subs = HEADER_PATTERN.subn('', text, count=1)
     if num_subs == 0: cleaned_text = METADATA_PATTERNS.sub('', text)
-    # Added basic check for document start as well
     doc_match = re.search(r'Document \d+ of \d+', cleaned_text)
-    if doc_match and doc_match.start() < 100: # If "Document X of Y" is near the start after other removals
-         cleaned_text = cleaned_text[doc_match.end():]
+    if doc_match and doc_match.start() < 100: cleaned_text = cleaned_text[doc_match.end():]
     return cleaned_text.strip()
 
 def prepare_text_for_filter_llm(header_stripped_text):
@@ -65,40 +64,38 @@ def prepare_text_for_filter_llm(header_stripped_text):
     try:
         text = URL_PATTERN.sub(' ', header_stripped_text)
         text = WHITESPACE_PATTERN.sub(' ', text).strip()
-        # Use character limit based on context length
-        char_limit = MAX_CONTEXT_LEN_FILTER * 5 # Heuristic
+        char_limit = MAX_CONTEXT_LEN_FILTER * 5
         return text[:char_limit]
     except Exception as e: logger.warning(f"Cleaning error (filter LLM): {e}. Text: {header_stripped_text[:100]}..."); return ""
 
-# --- LLM Model Loading (Using FP16 as requested) ---
+# --- LLM Model Loading ---
 def load_filter_llm_model_and_tokenizer(model_id_path):
-    """Loads the specified LLM using FP16 and device_map."""
-    model_path = Path(model_id_path)
-    if not model_path.exists() or not model_path.is_dir():
-         logger.error(f"Model directory not found at: {model_path}")
-         raise FileNotFoundError(f"Model directory not found: {model_path}")
-
+    """Loads the specified LLM using BF16/FP16 and device_map."""
+    model_id_or_path = model_id_path # Use HF ID or local path passed
     try:
-        logger.info(f"--- Loading Filter LLM & Tokenizer ({model_path}) ---")
+        logger.info(f"--- Loading Filter LLM & Tokenizer ({model_id_or_path}) ---")
         if not torch.cuda.is_available(): logger.error("CUDA not available."); raise RuntimeError("CUDA not available")
         logger.info(f"Found {torch.cuda.device_count()} GPU(s).")
 
-        # *** Force FP16 loading as requested ***
-        target_dtype = torch.float16
-        logger.info(f"Attempting to load model in FP16...")
+        target_dtype = torch.float32 # Default
+        if torch.cuda.is_bf16_supported():
+            target_dtype = torch.bfloat16
+            logger.info("BF16 is supported. Loading model in BF16.")
+        else:
+            target_dtype = torch.float16
+            logger.info("BF16 not supported. Loading model in FP16.")
 
-        # Use device_map="auto"
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, # Use the Path object
-            torch_dtype=target_dtype, # Force FP16
+            model_id_or_path,
+            torch_dtype=target_dtype,
             device_map="auto",
-            trust_remote_code=True # Often needed for community models/Qwen
+            trust_remote_code=True
         )
-        logger.info(f"Filter LLM model loaded with forced dtype: {model.dtype}.")
+        logger.info(f"Filter LLM model loaded with dtype: {model.dtype}.")
         logger.info(f"Filter LLM model device map: {model.hf_device_map}")
 
         logger.info("Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, padding_side='left')
+        tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=True, padding_side='left')
         logger.info("Tokenizer loaded.")
         if tokenizer.pad_token_id is None:
             if tokenizer.eos_token_id is not None:
@@ -118,7 +115,7 @@ def format_filter_prompt(text_chunk):
     """Creates the prompt asking the LLM to identify non-MIC articles."""
     instructions = """Analyze the following article text. Determine if the text is CLEARLY and DEFINITIVELY **NOT** about a militarized clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news, sports, finance, accidents, politics without direct military clashes, etc.
 
-If you are **highly confident** the text is **NOT** an MIC event as described, answer ONLY with the word "YES".
+If you are **confident** the text is **NOT** an MIC event as described, answer ONLY with the word "YES".
 Otherwise, if there is any possibility it *could* be an MIC event, or if you are unsure, answer ONLY with the word "NO".
 
 Article Text:
@@ -160,6 +157,53 @@ def load_data_only(directory, header_stripper):
     logger.info(f"   Valid items loaded for processing: {len(all_items):,}")
     return all_items
 
+# --- LLM Filtering Verification Function ---
+def run_filter_verification(model, tokenizer, gen_kwargs):
+    """Runs the filter LLM on a known MIC and non-MIC example."""
+    logger.info("--- Running Filter LLM Verification ---")
+    samples = {
+        "Potential MIC": "Reports emerged on Tuesday detailing a border clash between troops from Country A and Country B near the disputed checkpoint XY. Initial accounts suggest three soldiers from Country A were killed during the firefight, while Country B acknowledged suffering 'some casualties'.",
+        "Likely Non-MIC (Sports)": "The Lions secured a stunning victory over the Eagles last night with a final score of 28-24. Quarterback Johnson threw three touchdown passes, including the game-winner in the final minute. Fans celebrated wildly as the team clinched the division title."
+    }
+    results = {}
+    is_dataparallel = isinstance(model, torch.nn.DataParallel)
+    model_device = next(model.parameters()).device
+
+    for name, text in samples.items():
+        logger.info(f"\nVerifying: {name}")
+        logger.info(f"Input Text:\n{text}")
+        prompt_messages = format_filter_prompt(text)
+        try:
+            input_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            tokenized_input = tokenizer(input_text, return_tensors="pt").to(model_device) # No padding needed for single input
+
+            with torch.no_grad():
+                generate_func = model.module.generate if is_dataparallel else model.generate
+                outputs = generate_func(input_ids=tokenized_input['input_ids'], attention_mask=tokenized_input['attention_mask'], **gen_kwargs)
+                input_length = tokenized_input['input_ids'].shape[1]
+                generated_tokens = outputs[:, input_length:]
+                response = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+            logger.info(f"Raw Output: '{response}'")
+            results[name] = response.strip().upper()
+            del outputs, tokenized_input
+        except Exception as e:
+            logger.error(f"Error during verification for '{name}': {e}")
+            results[name] = "VERIFICATION_ERROR"
+
+    logger.info("--- Filter Verification Complete ---")
+    logger.info(f"Expected 'Potential MIC' -> NO (Result: {results.get('Potential MIC', 'ERROR')})")
+    logger.info(f"Expected 'Likely Non-MIC (Sports)' -> YES (Result: {results.get('Likely Non-MIC (Sports)', 'ERROR')})")
+    # Simple check if results match expectations
+    mic_correct = results.get('Potential MIC') == 'NO'
+    non_mic_correct = results.get('Likely Non-MIC (Sports)') == 'YES'
+    if mic_correct and non_mic_correct:
+        logger.info("Verification results match expectations.")
+        return True
+    else:
+        logger.warning("Verification results DO NOT match expectations! Check model/prompt.")
+        return False
+
+
 # --- LLM Filtering Execution ---
 def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs):
     """Uses LLM to classify items as definitely NOT MIC."""
@@ -168,22 +212,16 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
     all_decisions = {} # Store decision for each original index: True=Keep, False=Remove
     num_processed = 0
     num_excluded = 0
-    is_dataparallel = isinstance(model, torch.nn.DataParallel) # Check if DP wrapped (might happen with device_map auto indirectly?)
-    model_device = next(model.parameters()).device # Get device where model (or main part) is
+    is_dataparallel = isinstance(model, torch.nn.DataParallel)
+    model_device = next(model.parameters()).device
 
-    # Prepare prompts and original indices
     prompts_and_indices = []
     for idx, item in enumerate(items_to_process):
-        # Use the function to clean and truncate text before formatting prompt
         cleaned_body = prepare_text_for_filter_llm(item["article_body"])
-        if cleaned_body:
-            prompt_messages = format_filter_prompt(cleaned_body)
-            prompts_and_indices.append({"messages": prompt_messages, "original_index": idx})
-        else:
-            all_decisions[idx] = True # Keep items with empty bodies
+        if cleaned_body: prompts_and_indices.append({"messages": format_filter_prompt(cleaned_body), "original_index": idx})
+        else: all_decisions[idx] = True
 
     if not prompts_and_indices: logger.error("No valid items to filter."); return {}
-
     total_batches = (len(prompts_and_indices) + batch_size - 1) // batch_size
     logger.info(f"Total batches for LLM filtering: {total_batches}")
 
@@ -191,44 +229,36 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
         batch_data = prompts_and_indices[i : i+batch_size]
         batch_messages = [item['messages'] for item in batch_data]
         batch_original_indices = [item['original_index'] for item in batch_data]
-        tokenized_inputs = None
-        batch_num = i // batch_size + 1
+        tokenized_inputs = None; batch_num = i // batch_size + 1
 
         try:
-            # Apply chat template with thinking disabled
             batch_inputs_text = [ tokenizer.apply_chat_template( p, tokenize=False, add_generation_prompt=True, enable_thinking=False ) for p in batch_messages ]
-            tokenized_inputs = tokenizer( batch_inputs_text, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONTEXT_LEN_FILTER, return_attention_mask=True ).to(model_device) # Move to primary model device
-        except Exception as e: logger.error(f"Tokenization/Template error batch {batch_num}/{total_batches}: {e}", exc_info=True); all_decisions.update({idx: True for idx in batch_original_indices}); continue
+            tokenized_inputs = tokenizer( batch_inputs_text, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONTEXT_LEN_FILTER, return_attention_mask=True ).to(model_device)
+        except Exception as e: logger.error(f"Tokenization error batch {batch_num}/{total_batches}: {e}", exc_info=True); all_decisions.update({idx: True for idx in batch_original_indices}); continue
 
         raw_responses = ["ERROR"] * len(batch_messages)
         try:
             with torch.no_grad():
-                # Use model.module.generate if DataParallel wrapped (less likely with device_map but check)
                 generate_func = model.module.generate if is_dataparallel else model.generate
                 outputs = generate_func( input_ids=tokenized_inputs['input_ids'], attention_mask=tokenized_inputs['attention_mask'], **gen_kwargs )
-                input_length = tokenized_inputs['input_ids'].shape[1]
-                generated_tokens = outputs[:, input_length:]
-                raw_responses = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-                del outputs
+                input_length = tokenized_inputs['input_ids'].shape[1]; generated_tokens = outputs[:, input_length:]
+                raw_responses = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True); del outputs
         except RuntimeError as e:
-            if "out of memory" in str(e).lower(): logger.warning(f"OOM LLM filter batch {batch_num}. Marking items as KEEP.")
-            else: logger.error(f"Runtime error LLM filter batch {batch_num}: {e}", exc_info=False)
+            if "out of memory" in str(e).lower(): logger.warning(f"OOM filter batch {batch_num}. Marking KEEP.")
+            else: logger.error(f"Runtime error filter batch {batch_num}: {e}", exc_info=False)
             all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
-        except Exception as e: logger.error(f"Unexpected error LLM filter batch {batch_num}: {e}", exc_info=False); all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
+        except Exception as e: logger.error(f"Unexpected error filter batch {batch_num}: {e}", exc_info=False); all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
         finally:
              if tokenized_inputs is not None: del tokenized_inputs
-             gc.collect(); # Optional: torch.cuda.empty_cache()
+             gc.collect()
 
-
-        # Process responses for this batch
         for idx, response in enumerate(raw_responses):
             original_idx = batch_original_indices[idx]
-            # Only update if no error occurred during generation for this item
-            if original_idx not in all_decisions or all_decisions[original_idx] is True:
+            if original_idx not in all_decisions:
                  response_clean = response.strip().upper()
-                 if response_clean == "YES": all_decisions[original_idx] = False; num_excluded += 1 # Exclude
-                 else: all_decisions[original_idx] = True # Keep (NO or garbage or error string)
-                 if response_clean != "NO" and response_clean != "YES": logger.debug(f"LLM filter got unexpected answer item {original_idx}: '{response}'. Keeping.")
+                 if response_clean == "YES": all_decisions[original_idx] = False; num_excluded += 1
+                 else: all_decisions[original_idx] = True
+                 if response_clean != "NO" and response_clean != "YES": logger.debug(f"Unexpected filter answer item {original_idx}: '{response}'. Keeping.")
         num_processed += len(batch_messages)
         if batch_num % 50 == 0 or batch_num == total_batches: logger.info(f"Processed filter batch {batch_num}/{total_batches}...")
 
@@ -252,10 +282,9 @@ def save_tagged_data(all_original_items, candidate_status, output_dir, file_patt
     saved_count = 0; excluded_count_saving = 0
     try:
         for i, item_data in enumerate(tqdm(all_original_items, desc="Saving Tagged Items", unit="item", dynamic_ncols=True)):
-            is_candidate = candidate_status.get(i, True) # Default keep if index missing
+            is_candidate = candidate_status.get(i, True)
             item_data_copy = item_data.copy()
             item_data_copy['is_mic_event_candidate'] = is_candidate
-            # No scores to add in this version
             json_line = json.dumps(item_data_copy); outfile.write(json_line + '\n'); items_in_batch += 1; saved_count += 1
             if not is_candidate: excluded_count_saving +=1
             if items_in_batch >= batch_size and i < len(all_original_items) - 1:
@@ -277,7 +306,7 @@ def save_tagged_data(all_original_items, candidate_status, output_dir, file_patt
 def main_filtering_session():
     overall_start_time = time.time()
     logger.info("\n=====================================================")
-    logger.info("====== Starting MIC Pre-Filtering Pipeline (Local Qwen3) =====")
+    logger.info("====== Starting MIC Pre-Filtering Pipeline (Qwen Filter) =====")
     logger.info(f"====== Start Time: {datetime.now()} ======")
     logger.info("=====================================================\n")
 
@@ -293,15 +322,20 @@ def main_filtering_session():
     logger.info("\n--- Phase 2: Loading Filter LLM ---")
     phase2_start = time.time()
     try: llm_model, llm_tokenizer = load_filter_llm_model_and_tokenizer(MODEL_ID)
-    except FileNotFoundError: return # Exit if model dir not found
     except Exception as e: logger.error(f"Fatal: Filter LLM load failed. {e}", exc_info=True); return
     phase2_end = time.time(); logger.info(f"Phase 2 (Filter LLM Load) finished in {phase2_end - phase2_start:.2f} seconds.")
     pad_id = llm_tokenizer.pad_token_id; eos_id = llm_tokenizer.eos_token_id
-    # Handle potential None values defensively
-    if pad_id is None: pad_id = eos_id
+    if pad_id is None: pad_id = eos_id # Use EOS if pad is missing
     if pad_id is None or eos_id is None: logger.error("CRITICAL: Could not determine valid pad/eos token IDs."); return
     FILTER_GEN_KWARGS = { "max_new_tokens": MAX_NEW_TOKENS_FILTER, "do_sample": False, "pad_token_id": int(pad_id), "eos_token_id": int(eos_id), }
     logger.info(f"Filter LLM Generation Kwargs configured: {FILTER_GEN_KWARGS}")
+
+    # --- Run Filter Verification ---
+    logger.info("\n--- Phase 2b: Running Filter Verification ---")
+    verification_passed = run_filter_verification(llm_model, llm_tokenizer, FILTER_GEN_KWARGS)
+    if not verification_passed:
+        logger.warning("Filter verification failed! Results may be unreliable. Continuing cautiously...")
+        # Optionally add: return # To abort if verification fails
 
     # Phase 3: Run LLM Filtering
     logger.info("\n--- Phase 3: Running LLM Filtering ---")
@@ -335,16 +369,13 @@ def main_filtering_session():
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    logger.info("--- Script Execution Started (Local Qwen Pre-Filtering) ---")
-    # Ensure input directory exists
+    logger.info("--- Script Execution Started (Qwen Pre-Filtering Session) ---")
     if not STEP1_INPUT_DIR.exists() or not STEP1_INPUT_DIR.is_dir():
         logger.error(f"Input directory missing: {STEP1_INPUT_DIR}"); logger.error("Pipeline aborting.")
     else:
-        # Ensure CUDA is available
         if not torch.cuda.is_available(): logger.error("CUDA not available. Aborting.")
-        # Check compute capability
         elif torch.cuda.get_device_capability(0)[0] < 7: logger.warning("GPU compute capability < 7.0 (Volta). BF16/FP16 support may vary.")
-        main_filtering_session() # Run the filtering session
+        main_filtering_session()
     logger.info("--- Script Execution Finished ---")
 
 # --- REMINDER: SESSION 2 uses the data saved in TAGGED_OUTPUT_DIR ---
