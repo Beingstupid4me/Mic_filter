@@ -30,20 +30,20 @@ warnings.filterwarnings("ignore", message=".*Unable to register cuDNN factory.*"
 warnings.filterwarnings("ignore", message=".*Unable to register cuBLAS factory.*")
 warnings.filterwarnings("ignore", message=".*`do_sample` is set to `False`.*")
 warnings.filterwarnings("ignore", message=".*A decoder-only architecture is being used.*")
-# Ignore specific FP8 warnings if they become noisy during testing
-# warnings.filterwarnings("ignore", message=".*Torch AMP is not available.*")
+warnings.filterwarnings("ignore", message=".*Passing `attn_implementation_preference` is deprecated.*")
+warnings.filterwarnings("ignore", message=".*Using the pipeline API to.*")
 
 # --- Input/Output Paths ---
-STEP1_INPUT_DIR = Path("../Amartya_tasker/structured_parsed_chunks_combined") # <<< UPDATED
-TAGGED_OUTPUT_DIR = Path("./filtered_tagged_chunks") # <<< UPDATED
+STEP1_INPUT_DIR = Path("../Amartya_tasker/structured_parsed_chunks_combined") # Local input path
+TAGGED_OUTPUT_DIR = Path("./filtered_tagged_chunks") # Local output path
 TAGGED_OUTPUT_FILE_PATTERN = "tagged_chunk_batch_{batch_num}.jsonl"
-FILTER_STATS_CSV = Path("./qwen3_filter_stats.csv") # <<< UPDATED (though not used in this script)
+FILTER_STATS_CSV = Path("./qwen3_filter_stats.csv") # Local stats path
 
 # --- Model Configuration ---
-MODEL_ID = "../Qwen3-0.6B" # <<< UPDATED to local path
-LLM_FILTER_BATCH_SIZE = 128 # Adjust based on V100 16GB VRAM with FP8
+MODEL_ID = "../Qwen3-0.6B" # <<< USING LOCAL QWEN3 PATH as requested
+LLM_FILTER_BATCH_SIZE = 128 # Adjust based on V100 16GB VRAM with FP16
 MAX_CONTEXT_LEN_FILTER = 2048
-MAX_NEW_TOKENS_FILTER = 10 # Enough for YES/NO + EOS
+MAX_NEW_TOKENS_FILTER = 10
 
 # --- Text Cleaning & Preparation ---
 HEADER_PATTERN = re.compile(r'^Search Strategy.*?Results: \d+\s*(?=Document \d+ of \d+|\n\n|$)', re.DOTALL | re.MULTILINE | re.IGNORECASE)
@@ -54,6 +54,10 @@ def strip_proquest_header(text):
     if not isinstance(text, str): return ""
     cleaned_text, num_subs = HEADER_PATTERN.subn('', text, count=1)
     if num_subs == 0: cleaned_text = METADATA_PATTERNS.sub('', text)
+    # Added basic check for document start as well
+    doc_match = re.search(r'Document \d+ of \d+', cleaned_text)
+    if doc_match and doc_match.start() < 100: # If "Document X of Y" is near the start after other removals
+         cleaned_text = cleaned_text[doc_match.end():]
     return cleaned_text.strip()
 
 def prepare_text_for_filter_llm(header_stripped_text):
@@ -61,14 +65,15 @@ def prepare_text_for_filter_llm(header_stripped_text):
     try:
         text = URL_PATTERN.sub(' ', header_stripped_text)
         text = WHITESPACE_PATTERN.sub(' ', text).strip()
-        # Rough character limit - tokenizer handles final token limit
-        return text[:MAX_CONTEXT_LEN_FILTER * 5]
+        # Use character limit based on context length
+        char_limit = MAX_CONTEXT_LEN_FILTER * 5 # Heuristic
+        return text[:char_limit]
     except Exception as e: logger.warning(f"Cleaning error (filter LLM): {e}. Text: {header_stripped_text[:100]}..."); return ""
 
-# --- LLM Model Loading ---
+# --- LLM Model Loading (Using FP16 as requested) ---
 def load_filter_llm_model_and_tokenizer(model_id_path):
-    """Loads the small Qwen3 model, trying FP8."""
-    model_path = Path(model_id_path) # Convert string path to Path object
+    """Loads the specified LLM using FP16 and device_map."""
+    model_path = Path(model_id_path)
     if not model_path.exists() or not model_path.is_dir():
          logger.error(f"Model directory not found at: {model_path}")
          raise FileNotFoundError(f"Model directory not found: {model_path}")
@@ -78,29 +83,18 @@ def load_filter_llm_model_and_tokenizer(model_id_path):
         if not torch.cuda.is_available(): logger.error("CUDA not available."); raise RuntimeError("CUDA not available")
         logger.info(f"Found {torch.cuda.device_count()} GPU(s).")
 
-        target_dtype = None
-        # Check for FP8 compatibility more reliably
-        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported() and hasattr(torch, 'float8_e4m3fn'): # Need bf16 for FP8 usually
-             try:
-                 # Try creating a tensor to be sure
-                 _ = torch.zeros(1, dtype=torch.float8_e4m3fn)
-                 target_dtype = torch.float8_e4m3fn
-                 logger.info("Attempting to load model in FP8 (float8_e4m3fn)...")
-             except Exception as e:
-                 logger.warning(f"FP8 E4M3FN check failed ({e}), falling back to BF16/FP16.")
-                 target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        else:
-            target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            logger.info(f"FP8 support not detected/available, falling back to {target_dtype}.")
+        # *** Force FP16 loading as requested ***
+        target_dtype = torch.float16
+        logger.info(f"Attempting to load model in FP16...")
 
-        # Use device_map="auto" - usually places small models entirely on cuda:0
+        # Use device_map="auto"
         model = AutoModelForCausalLM.from_pretrained(
             model_path, # Use the Path object
-            torch_dtype=target_dtype,
+            torch_dtype=target_dtype, # Force FP16
             device_map="auto",
-            trust_remote_code=True
+            trust_remote_code=True # Often needed for community models/Qwen
         )
-        logger.info(f"Filter LLM model loaded with dtype: {model.dtype}.")
+        logger.info(f"Filter LLM model loaded with forced dtype: {model.dtype}.")
         logger.info(f"Filter LLM model device map: {model.hf_device_map}")
 
         logger.info("Loading tokenizer...")
@@ -174,12 +168,13 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
     all_decisions = {} # Store decision for each original index: True=Keep, False=Remove
     num_processed = 0
     num_excluded = 0
-    is_dataparallel = isinstance(model, torch.nn.DataParallel)
-    model_device = next(model.parameters()).device # Get device where model (or wrapper) is
+    is_dataparallel = isinstance(model, torch.nn.DataParallel) # Check if DP wrapped (might happen with device_map auto indirectly?)
+    model_device = next(model.parameters()).device # Get device where model (or main part) is
 
     # Prepare prompts and original indices
     prompts_and_indices = []
     for idx, item in enumerate(items_to_process):
+        # Use the function to clean and truncate text before formatting prompt
         cleaned_body = prepare_text_for_filter_llm(item["article_body"])
         if cleaned_body:
             prompt_messages = format_filter_prompt(cleaned_body)
@@ -200,6 +195,7 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
         batch_num = i // batch_size + 1
 
         try:
+            # Apply chat template with thinking disabled
             batch_inputs_text = [ tokenizer.apply_chat_template( p, tokenize=False, add_generation_prompt=True, enable_thinking=False ) for p in batch_messages ]
             tokenized_inputs = tokenizer( batch_inputs_text, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONTEXT_LEN_FILTER, return_attention_mask=True ).to(model_device) # Move to primary model device
         except Exception as e: logger.error(f"Tokenization/Template error batch {batch_num}/{total_batches}: {e}", exc_info=True); all_decisions.update({idx: True for idx in batch_original_indices}); continue
@@ -207,6 +203,7 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
         raw_responses = ["ERROR"] * len(batch_messages)
         try:
             with torch.no_grad():
+                # Use model.module.generate if DataParallel wrapped (less likely with device_map but check)
                 generate_func = model.module.generate if is_dataparallel else model.generate
                 outputs = generate_func( input_ids=tokenized_inputs['input_ids'], attention_mask=tokenized_inputs['attention_mask'], **gen_kwargs )
                 input_length = tokenized_inputs['input_ids'].shape[1]
@@ -216,19 +213,21 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
         except RuntimeError as e:
             if "out of memory" in str(e).lower(): logger.warning(f"OOM LLM filter batch {batch_num}. Marking items as KEEP.")
             else: logger.error(f"Runtime error LLM filter batch {batch_num}: {e}", exc_info=False)
-            all_decisions.update({idx: True for idx in batch_original_indices})
-        except Exception as e: logger.error(f"Unexpected error LLM filter batch {batch_num}: {e}", exc_info=False); all_decisions.update({idx: True for idx in batch_original_indices})
+            all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
+        except Exception as e: logger.error(f"Unexpected error LLM filter batch {batch_num}: {e}", exc_info=False); all_decisions.update({idx: True for idx in batch_original_indices}) # Keep on error
         finally:
              if tokenized_inputs is not None: del tokenized_inputs
-             gc.collect(); #torch.cuda.empty_cache() # Avoid frequent cache clear
+             gc.collect(); # Optional: torch.cuda.empty_cache()
+
 
         # Process responses for this batch
         for idx, response in enumerate(raw_responses):
             original_idx = batch_original_indices[idx]
-            if original_idx not in all_decisions: # Process only if no error occurred before
+            # Only update if no error occurred during generation for this item
+            if original_idx not in all_decisions or all_decisions[original_idx] is True:
                  response_clean = response.strip().upper()
                  if response_clean == "YES": all_decisions[original_idx] = False; num_excluded += 1 # Exclude
-                 else: all_decisions[original_idx] = True # Keep (NO or garbage)
+                 else: all_decisions[original_idx] = True # Keep (NO or garbage or error string)
                  if response_clean != "NO" and response_clean != "YES": logger.debug(f"LLM filter got unexpected answer item {original_idx}: '{response}'. Keeping.")
         num_processed += len(batch_messages)
         if batch_num % 50 == 0 or batch_num == total_batches: logger.info(f"Processed filter batch {batch_num}/{total_batches}...")
@@ -256,7 +255,7 @@ def save_tagged_data(all_original_items, candidate_status, output_dir, file_patt
             is_candidate = candidate_status.get(i, True) # Default keep if index missing
             item_data_copy = item_data.copy()
             item_data_copy['is_mic_event_candidate'] = is_candidate
-            # We don't have separate scores in this version
+            # No scores to add in this version
             json_line = json.dumps(item_data_copy); outfile.write(json_line + '\n'); items_in_batch += 1; saved_count += 1
             if not is_candidate: excluded_count_saving +=1
             if items_in_batch >= batch_size and i < len(all_original_items) - 1:
@@ -278,7 +277,7 @@ def save_tagged_data(all_original_items, candidate_status, output_dir, file_patt
 def main_filtering_session():
     overall_start_time = time.time()
     logger.info("\n=====================================================")
-    logger.info("====== Starting MIC Pre-Filtering Pipeline (Qwen Filter) =====")
+    logger.info("====== Starting MIC Pre-Filtering Pipeline (Local Qwen3) =====")
     logger.info(f"====== Start Time: {datetime.now()} ======")
     logger.info("=====================================================\n")
 
@@ -294,11 +293,14 @@ def main_filtering_session():
     logger.info("\n--- Phase 2: Loading Filter LLM ---")
     phase2_start = time.time()
     try: llm_model, llm_tokenizer = load_filter_llm_model_and_tokenizer(MODEL_ID)
+    except FileNotFoundError: return # Exit if model dir not found
     except Exception as e: logger.error(f"Fatal: Filter LLM load failed. {e}", exc_info=True); return
     phase2_end = time.time(); logger.info(f"Phase 2 (Filter LLM Load) finished in {phase2_end - phase2_start:.2f} seconds.")
     pad_id = llm_tokenizer.pad_token_id; eos_id = llm_tokenizer.eos_token_id
-    if pad_id is None or eos_id is None: logger.error("CRITICAL: pad/eos token ID is None."); return
-    FILTER_GEN_KWARGS = { "max_new_tokens": MAX_NEW_TOKENS_FILTER, "do_sample": False, "pad_token_id": pad_id, "eos_token_id": eos_id, }
+    # Handle potential None values defensively
+    if pad_id is None: pad_id = eos_id
+    if pad_id is None or eos_id is None: logger.error("CRITICAL: Could not determine valid pad/eos token IDs."); return
+    FILTER_GEN_KWARGS = { "max_new_tokens": MAX_NEW_TOKENS_FILTER, "do_sample": False, "pad_token_id": int(pad_id), "eos_token_id": int(eos_id), }
     logger.info(f"Filter LLM Generation Kwargs configured: {FILTER_GEN_KWARGS}")
 
     # Phase 3: Run LLM Filtering
@@ -333,14 +335,16 @@ def main_filtering_session():
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    logger.info("--- Script Execution Started (Qwen3 Pre-Filtering Session) ---")
+    logger.info("--- Script Execution Started (Local Qwen Pre-Filtering) ---")
     # Ensure input directory exists
     if not STEP1_INPUT_DIR.exists() or not STEP1_INPUT_DIR.is_dir():
         logger.error(f"Input directory missing: {STEP1_INPUT_DIR}"); logger.error("Pipeline aborting.")
     else:
         # Ensure CUDA is available
         if not torch.cuda.is_available(): logger.error("CUDA not available. Aborting.")
-        # Check compute capability for potential FP8/BF16 support messages
-        elif torch.cuda.get_device_capability(0)[0] < 7: logger.warning("GPU compute capability < 7.0 (Volta). BF16/FP8 support may vary.")
+        # Check compute capability
+        elif torch.cuda.get_device_capability(0)[0] < 7: logger.warning("GPU compute capability < 7.0 (Volta). BF16/FP16 support may vary.")
         main_filtering_session() # Run the filtering session
     logger.info("--- Script Execution Finished ---")
+
+# --- REMINDER: SESSION 2 uses the data saved in TAGGED_OUTPUT_DIR ---
