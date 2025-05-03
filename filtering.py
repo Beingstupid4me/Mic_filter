@@ -121,7 +121,8 @@ Otherwise, if the checklist suggests it *might* be a relevant MIC event OR if yo
 Article Text:
 {context}
 
-Final Answer (ONLY REMOVE or KEEP, do not include anything else, final answer should be just one word):"""
+Final Answer (ONLY REMOVE or KEEP, do not include anything else, final answer should be just one word):
+/think """
     user_content = instructions.format(context=text_chunk)
     messages = [{"role": "user", "content": user_content}]
     return messages
@@ -170,7 +171,7 @@ def run_filter_verification(model, tokenizer, gen_kwargs):
         prompt_messages = format_filter_prompt(text) # Uses the checklist prompt
         final_answer = "VERIFICATION_ERROR"
         try:
-            input_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True) # Enable thinking
+            input_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True, enable_thinking = False) # Enable thinking
             tokenized_input = tokenizer(input_text, return_tensors="pt").to(model_device)
             with torch.no_grad():
                 generate_func = model.module.generate if is_dataparallel else model.generate
@@ -179,7 +180,7 @@ def run_filter_verification(model, tokenizer, gen_kwargs):
                 raw_response = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
             logger.info(f"Raw Output (may include think): '{raw_response}'")
             think_end_tag = "</think>"; think_end_index = raw_response.find(think_end_tag)
-            final_answer_text = raw_response.split(think_end_tag)[1]
+            final_answer_text = raw_response[think_end_index + len(think_end_tag):].strip() if think_end_index != -1 else raw_response.strip()
             logger.info(f"Extracted final answer: '{final_answer_text}'")
             # Use uppercase for reliable comparison
             results[name] = final_answer_text.upper()
@@ -224,7 +225,7 @@ def run_llm_filtering(model, tokenizer, items_to_process, batch_size, gen_kwargs
 
         try:
             # Thinking enabled by default
-            batch_inputs_text = [ tokenizer.apply_chat_template( p, tokenize=False, add_generation_prompt=True ) for p in batch_messages ]
+            batch_inputs_text = [ tokenizer.apply_chat_template( p, tokenize=False, add_generation_prompt=True, enable_thinking = False ) for p in batch_messages ]
             tokenized_inputs = tokenizer( batch_inputs_text, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONTEXT_LEN_FILTER, return_attention_mask=True ).to(model_device)
         except Exception as e: logger.error(f"Tokenization error batch {batch_num}/{total_batches}: {e}", exc_info=True); all_decisions.update({idx: True for idx in batch_original_indices}); continue
 
