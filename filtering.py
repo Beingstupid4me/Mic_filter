@@ -113,9 +113,9 @@ def load_filter_llm_model_and_tokenizer(model_id_path):
 # --- LLM Prompt Engineering for Filtering ---
 def format_filter_prompt(text_chunk):
     """Creates the prompt asking the LLM to identify non-MIC articles."""
-    instructions = """Analyze the following article text. Determine if the text is CLEARLY **NOT** about a militarized clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news or sports news or finance news or accidents news or political news, without direct military clashes, etc.
+    instructions = """You are a defense analyst. Analyze the following article text. Determine if the text is CLEARLY **NOT** about a militarized inter-state clash or armed conflict between the military forces of two different countries where military personnel died. Examples of non-MIC events include domestic news or sports news or finance news or accidents news or political news, without direct military clashes, etc.
 
-If you are **confident** the text is **NOT** an MIC event as described, answer ONLY with the word "YES".
+If you are **highly confident** the text is **NOT** an MIC event as described, answer ONLY with the word "YES".
 Otherwise, if there is a possibility it *could* be an MIC event, or if you are unsure, answer ONLY with the word "NO".
 
 Article Text:
